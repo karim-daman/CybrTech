@@ -1,0 +1,40 @@
+{
+  "header": {
+    "brand": "CybrTech",
+    "tagline": "制御パネル",
+    "settings": "設定"
+  },
+  "status": {
+    "server": "サーバー",
+    "mcp": "MCP",
+    "online": "稼働中",
+    "offline": "停止中"
+  },
+  "options": {
+    "title": "設定オプション",
+    "port": "ポート",
+    "debug": "デバッグモード",
+    "on": "オン",
+    "off": "オフ"
+  },
+  "buttons": {
+    "launch": "起動する",
+    "launching": "起動中…",
+    "stop": "停止する",
+    "stopping": "停止中…",
+    "health": "ヘルスチェック",
+    "clear": "消去"
+  },
+  "terminal": {
+    "title": "出力",
+    "empty": "出力待機中…",
+    "health_cmd": "GET /health"
+  },
+  "settings": {
+    "title": "設定",
+    "language": "言語",
+    "english": "英語",
+    "japanese": "日本語",
+    "close": "閉じる"
+  }
+}

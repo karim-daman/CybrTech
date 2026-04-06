@@ -1,0 +1,40 @@
+{
+  "header": {
+    "brand": "CybrTech",
+    "tagline": "MCP Control Panel",
+    "settings": "Settings"
+  },
+  "status": {
+    "server": "Server",
+    "mcp": "MCP",
+    "online": "Online",
+    "offline": "Offline"
+  },
+  "options": {
+    "title": "Configuration",
+    "port": "Port",
+    "debug": "Debug Mode",
+    "on": "ON",
+    "off": "OFF"
+  },
+  "buttons": {
+    "launch": "Launch CybrTech",
+    "launching": "Starting…",
+    "stop": "Stop CybrTech",
+    "stopping": "Stopping…",
+    "health": "Health Check",
+    "clear": "Clear"
+  },
+  "terminal": {
+    "title": "Output",
+    "empty": "Awaiting output…",
+    "health_cmd": "GET /health"
+  },
+  "settings": {
+    "title": "Settings",
+    "language": "Language",
+    "english": "English",
+    "japanese": "Japanese",
+    "close": "Close"
+  }
+}
