@@ -7,6 +7,7 @@ use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::time::{Duration, Instant};
 #[allow(unused_imports)]
 use tauri::{Emitter, Manager, State};
@@ -261,6 +262,20 @@ fn stop_child_process(child: &mut Child, label: &str) -> Result<String, String> 
     Ok(format!("{label} stopped"))
 }
 
+fn generate_internal_api_token(port: u16) -> String {
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("cybrtech-{port:x}-{:x}-{:x}", std::process::id(), nonce)
+}
+
+fn rollback_managed_child(slot: &Mutex<Option<Child>>, label: &str) {
+    if let Some(mut child) = slot.lock().unwrap().take() {
+        let _ = stop_child_process(&mut child, label);
+    }
+}
+
 #[tauri::command]
 async fn bootstrap(app: tauri::AppHandle) -> Result<String, String> {
     let base = resolve_cybrtech_path(&app)?;
@@ -335,6 +350,8 @@ async fn launch_all(
     let (python, runtime_dir) = resolve_python_command(&app, &base)?;
     let server = base.join("cybrtech_server.py");
     let mcp = base.join("cybrtech_mcp.py");
+    let server_url = format!("http://127.0.0.1:{port}");
+    let internal_api_token = generate_internal_api_token(port);
 
     if !python.exists() {
         return Err(format!(
@@ -356,6 +373,8 @@ async fn launch_all(
             .current_dir(&base)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("CYBRTECH_HOST", "127.0.0.1")
+            .env("CYBRTECH_COMMAND_TOKEN", &internal_api_token)
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1");
         if debug {
@@ -373,16 +392,26 @@ async fn launch_all(
         *proc = Some(child);
     }
 
-    wait_for_port(port, 20)?;
+    if let Err(err) = wait_for_port(port, 20) {
+        rollback_managed_child(&state.server_process, "Server");
+        return Err(format!("{err}. Server process was rolled back."));
+    }
 
     {
         let mut proc = state.mcp_process.lock().unwrap();
+        if proc.is_some() {
+            rollback_managed_child(&state.server_process, "Server");
+            return Err("MCP already running".into());
+        }
+
         let mut command = Command::new(&python);
         command
             .arg(&mcp)
+            .args(["--server", &server_url])
             .current_dir(&base)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .env("CYBRTECH_COMMAND_TOKEN", &internal_api_token)
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1");
         if let Some(runtime_dir) = runtime_dir.as_deref() {
@@ -391,7 +420,10 @@ async fn launch_all(
 
         let mut child = command
             .spawn()
-            .map_err(|e| format!("Failed to start MCP: {e}"))?;
+            .map_err(|e| {
+                rollback_managed_child(&state.server_process, "Server");
+                format!("Failed to start MCP: {e}")
+            })?;
         attach_child_logs(&app, &mut child, "mcp");
         *proc = Some(child);
     }
