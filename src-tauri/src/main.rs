@@ -1,18 +1,26 @@
-﻿#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use serde::Serialize;
 use std::env;
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 #[allow(unused_imports)]
-use tauri::{Manager, State};
+use tauri::{Emitter, Manager, State};
 
 struct AppState {
     server_process: Mutex<Option<Child>>,
     mcp_process: Mutex<Option<Child>>,
+}
+
+#[derive(Clone, Serialize)]
+struct ProcessLogEvent {
+    source: String,
+    stream: String,
+    message: String,
 }
 
 /// Finds the first system Python executable available on PATH.
@@ -71,7 +79,9 @@ fn wait_for_port(port: u16, timeout_secs: u64) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    Err(format!("Server did not respond within {timeout_secs} seconds"))
+    Err(format!(
+        "Server did not respond within {timeout_secs} seconds"
+    ))
 }
 
 fn run_and_capture(cmd: &mut Command) -> Result<(bool, String), String> {
@@ -96,7 +106,10 @@ fn configure_bundled_python_env(
     runtime_dir: &Path,
     cybrtech_dir: &Path,
 ) -> Result<(), String> {
-    let site_packages = cybrtech_dir.join("cybrtech-env").join("Lib").join("site-packages");
+    let site_packages = cybrtech_dir
+        .join("cybrtech-env")
+        .join("Lib")
+        .join("site-packages");
     let scripts_dir = cybrtech_dir.join("cybrtech-env").join("Scripts");
 
     if !site_packages.exists() {
@@ -111,8 +124,8 @@ fn configure_bundled_python_env(
         paths.extend(env::split_paths(&existing_path));
     }
 
-    let joined_path = env::join_paths(paths)
-        .map_err(|e| format!("Failed to prepare Python PATH: {e}"))?;
+    let joined_path =
+        env::join_paths(paths).map_err(|e| format!("Failed to prepare Python PATH: {e}"))?;
 
     cmd.env("PATH", joined_path)
         .env("PYTHONHOME", runtime_dir)
@@ -127,7 +140,10 @@ fn resolve_python_command(
     app: &tauri::AppHandle,
     cybrtech_dir: &Path,
 ) -> Result<(PathBuf, Option<PathBuf>), String> {
-    let venv_python = cybrtech_dir.join("cybrtech-env").join("Scripts").join("python.exe");
+    let venv_python = cybrtech_dir
+        .join("cybrtech-env")
+        .join("Scripts")
+        .join("python.exe");
     if cfg!(debug_assertions) && venv_python.exists() {
         return Ok((venv_python, None));
     }
@@ -170,6 +186,79 @@ fn run_local_health_check(port: u16) -> Result<String, String> {
     }
 
     Err("Health endpoint returned an empty response".into())
+}
+
+fn spawn_log_pump<R>(app: tauri::AppHandle, source: &str, stream: &str, reader: R)
+where
+    R: Read + Send + 'static,
+{
+    let source = source.to_string();
+    let stream = stream.to_string();
+
+    std::thread::spawn(move || {
+        let reader = BufReader::new(reader);
+        for line in reader.lines() {
+            match line {
+                Ok(message) if !message.trim().is_empty() => {
+                    let _ = app.emit(
+                        "process-log",
+                        ProcessLogEvent {
+                            source: source.clone(),
+                            stream: stream.clone(),
+                            message,
+                        },
+                    );
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    let _ = app.emit(
+                        "process-log",
+                        ProcessLogEvent {
+                            source: source.clone(),
+                            stream: "stderr".into(),
+                            message: format!("Failed to read {source} {stream}: {err}"),
+                        },
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn attach_child_logs(app: &tauri::AppHandle, child: &mut Child, source: &str) {
+    if let Some(stdout) = child.stdout.take() {
+        spawn_log_pump(app.clone(), source, "stdout", stdout);
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_log_pump(app.clone(), source, "stderr", stderr);
+    }
+}
+
+fn stop_child_process(child: &mut Child, label: &str) -> Result<String, String> {
+    match child.try_wait().map_err(|e| e.to_string())? {
+        Some(status) => {
+            return Ok(format!(
+                "{label} already exited{}",
+                status
+                    .code()
+                    .map(|code| format!(" with code {code}"))
+                    .unwrap_or_default()
+            ));
+        }
+        None => {}
+    }
+
+    match child.kill() {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::InvalidInput => {
+            return Ok(format!("{label} was already stopping"));
+        }
+        Err(err) => return Err(err.to_string()),
+    }
+
+    let _ = child.wait();
+    Ok(format!("{label} stopped"))
 }
 
 #[tauri::command]
@@ -216,8 +305,10 @@ async fn bootstrap(app: tauri::AppHandle) -> Result<String, String> {
             return Err(format!(
                 "requirements.txt not found at: {}\nBase dir contents: {:?}",
                 req.display(),
-                std::fs::read_dir(&base)
-                    .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect::<Vec<_>>())
+                std::fs::read_dir(&base).map(|d| d
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name())
+                    .collect::<Vec<_>>())
             ));
         }
 
@@ -263,6 +354,8 @@ async fn launch_all(
             .arg(&server)
             .args(["--port", &port.to_string()])
             .current_dir(&base)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1");
         if debug {
@@ -272,9 +365,10 @@ async fn launch_all(
             configure_bundled_python_env(&mut command, runtime_dir, &base)?;
         }
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to start server: {e}"))?;
+        attach_child_logs(&app, &mut child, "server");
 
         *proc = Some(child);
     }
@@ -287,15 +381,18 @@ async fn launch_all(
         command
             .arg(&mcp)
             .current_dir(&base)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .env("PYTHONIOENCODING", "utf-8")
             .env("PYTHONUTF8", "1");
         if let Some(runtime_dir) = runtime_dir.as_deref() {
             configure_bundled_python_env(&mut command, runtime_dir, &base)?;
         }
 
-        let child = command
+        let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to start MCP: {e}"))?;
+        attach_child_logs(&app, &mut child, "mcp");
         *proc = Some(child);
     }
 
@@ -310,8 +407,7 @@ async fn launch_all(
 fn stop_server(state: State<AppState>) -> Result<String, String> {
     let mut proc = state.server_process.lock().unwrap();
     if let Some(mut child) = proc.take() {
-        child.kill().map_err(|e| e.to_string())?;
-        return Ok("Server stopped".into());
+        return stop_child_process(&mut child, "Server");
     }
     Err("Server was not running".into())
 }
@@ -320,8 +416,7 @@ fn stop_server(state: State<AppState>) -> Result<String, String> {
 fn stop_mcp(state: State<AppState>) -> Result<String, String> {
     let mut proc = state.mcp_process.lock().unwrap();
     if let Some(mut child) = proc.take() {
-        child.kill().map_err(|e| e.to_string())?;
-        return Ok("MCP stopped".into());
+        return stop_child_process(&mut child, "MCP");
     }
     Err("MCP was not running".into())
 }
@@ -353,4 +448,3 @@ fn main() {
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
-

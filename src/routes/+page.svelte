@@ -1,9 +1,11 @@
 <script lang="ts">
   import "../i18n/config";
   import { t } from "svelte-i18n";
-  import { onMount } from "svelte";
+  import { onMount, tick } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { language } from "../stores/language";
+  import { theme } from "../stores/theme";
   import SettingsPanel from "../components/SettingsPanel.svelte";
   import HealthInspector from "../components/HealthInspector.svelte";
   import { fly } from "svelte/transition";
@@ -29,31 +31,161 @@
   type LogType = "info" | "success" | "error" | "warn" | "muted" | "cmd";
 
   interface LogEntry {
+    id: number;
     ts: string;
     msg: string;
     type: LogType;
+    count?: number;
+  }
+
+  interface ProcessLogEvent {
+    source: string;
+    stream: string;
+    message: string;
   }
 
   let logs: LogEntry[] = [];
+  let terminalEl: HTMLDivElement | null = null;
+  let followLogs = true;
+  let nextLogId = 0;
+  const MAX_LOGS = 400;
+  const AUTO_SCROLL_THRESHOLD = 24;
+  const READY_BANNER = [
+    "     ██████╗██╗   ██╗██████╗ ██████╗ ████████╗███████╗ ██████╗██╗  ██╗",
+    "    ██╔════╝╚██╗ ██╔╝██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██╔════╝██║  ██║",
+    "    ██║      ╚████╔╝ ██████╔╝██████╔╝   ██║   █████╗  ██║     ███████║",
+    "    ██║       ╚██╔╝  ██╔══██╗██╔══██╗   ██║   ██╔══╝  ██║     ██╔══██║",
+    "    ╚██████╗   ██║   ██████╔╝██║  ██║   ██║   ███████╗╚██████╗██║  ██║",
+    "     ╚═════╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚═════╝╚═╝  ╚═╝",
+    "                                                                      "
+  ].join("\n");
 
-  onMount(async () => {
+  onMount(() => {
     language.init();
-    log("Checking environment...", "cmd");
-    try {
-      const res = await invoke<string>("bootstrap");
-      log(res === "bootstrapped" ? "Dependencies installed successfully" : "Environment ready", "success");
-    } catch (e) {
-      log(`Setup failed: ${e}`, "error");
-    }
+    theme.init();
+
+    let unlisten = () => {};
+
+    void (async () => {
+      unlisten = await listen<ProcessLogEvent>("process-log", (event) => {
+        const payload = event.payload;
+        const cleanMessage = normalizeProcessLog(payload);
+        if (!cleanMessage) return;
+
+        const prefix = payload.source.toUpperCase();
+        log(`[${prefix}] ${cleanMessage}`, classifyProcessLog(payload, cleanMessage));
+      });
+
+      log("Checking environment...", "cmd");
+      try {
+        const res = await invoke<string>("bootstrap");
+        log(res === "bootstrapped" ? "Dependencies installed successfully" : "Environment ready", "success");
+        log(READY_BANNER, "info");
+      } catch (e) {
+        log(`Setup failed: ${e}`, "error");
+      }
+    })();
+
+    return () => {
+      unlisten();
+    };
   });
 
   function log(msg: string, type: LogType = "info") {
     const ts = new Date().toLocaleTimeString("en-GB", { hour12: false });
-    logs = [...logs, { ts, msg, type }];
-    requestAnimationFrame(() => {
-      const el = document.getElementById("terminal");
-      if (el) el.scrollTop = el.scrollHeight;
-    });
+    const lastEntry = logs.at(-1);
+
+    if (lastEntry && lastEntry.msg === msg && lastEntry.type === type) {
+      logs = [
+        ...logs.slice(0, -1),
+        { ...lastEntry, count: (lastEntry.count ?? 1) + 1, ts }
+      ];
+    } else {
+      logs = [...logs, { id: nextLogId++, ts, msg, type }];
+      if (logs.length > MAX_LOGS) {
+        logs = logs.slice(-MAX_LOGS);
+      }
+    }
+
+    void scrollTerminalToBottom();
+  }
+
+  function stripAnsi(value: string) {
+    return value.replace(/\x1B\[[0-9;]*[A-Za-z]/g, "");
+  }
+
+  function decodeMojibake(value: string) {
+    if (!/[ÃÂâð]/.test(value)) return value;
+
+    try {
+      const bytes = Uint8Array.from(Array.from(value, (char) => char.charCodeAt(0) & 0xff));
+      return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+    } catch {
+      return value;
+    }
+  }
+
+  function normalizeProcessLog(payload: ProcessLogEvent) {
+    let message = stripAnsi(payload.message);
+    message = decodeMojibake(message);
+    message = message
+      .replace(/\r/g, "")
+      .replace(/�+/g, "")
+      .replace(/[^\x09\x0A\x0D\x20-\x7E]/g, " ")
+      .trim();
+
+    if (!message) return "";
+
+    message = message
+      .replace(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d+\s+-\s+[^-]+?\s+-\s+(DEBUG|INFO|WARNING|ERROR|CRITICAL)\s+-\s+/i, "")
+      .replace(/^\*\s+Serving Flask app\b.*$/i, "Flask app loaded")
+      .replace(/^\*\s+Debug mode:\s+off$/i, "Debug mode disabled")
+      .replace(/^\*\s+Debug mode:\s+on$/i, "Debug mode enabled")
+      .replace(/^\*\s+Running on\s+(.*)$/i, "Listening on $1")
+      .replace(/^WARNING:\s+This is a development server.*$/i, "Using Flask development server")
+      .replace(/^\*\s+Press CTRL\+C to quit$/i, "Server is ready")
+      .replace(/\s+/g, " ")
+      .trim();
+
+    if (!message) return "";
+    if (/^[\s\-_=~.]+$/.test(message)) return "";
+    if (/^[\p{S}\p{P}\p{M}\s]+$/u.test(message) && !/[A-Za-z0-9]/.test(message)) return "";
+    if (/^(INFO|WARNING|ERROR|DEBUG|CRITICAL)\s*:?$/i.test(message)) return "";
+    if (/^(Startup|Server) (info|banner)$/i.test(message)) return "";
+
+    return message;
+  }
+
+  function classifyProcessLog(payload: ProcessLogEvent, message: string): LogType {
+    if (/\b(ERROR|CRITICAL|FAILED|TRACEBACK|EXCEPTION)\b/i.test(message)) return "error";
+    if (/\b(WARN|WARNING|TIMEOUT|RETRY)\b/i.test(message)) return "warn";
+    if (/\b(SUCCESS|READY|STARTED|LISTENING ON|RUNNING ON|CONNECTED|REFRESHED)\b/i.test(message)) return "success";
+    if (payload.stream === "stderr") return "warn";
+    return "info";
+  }
+
+  function handleTerminalScroll() {
+    if (!terminalEl) return;
+    followLogs = isNearBottom(terminalEl);
+  }
+
+  function isNearBottom(element: HTMLElement) {
+    return element.scrollHeight - element.scrollTop - element.clientHeight <= AUTO_SCROLL_THRESHOLD;
+  }
+
+  async function scrollTerminalToBottom() {
+    if (!followLogs) return;
+    await tick();
+    if (terminalEl) {
+      terminalEl.scrollTop = terminalEl.scrollHeight;
+    }
+  }
+
+  function toggleFollowLogs() {
+    followLogs = !followLogs;
+    if (followLogs) {
+      void scrollTerminalToBottom();
+    }
   }
 
   async function launchAll() {
@@ -76,12 +208,16 @@
       try {
         const res: string = await invoke(cmd);
         log(res, "warn");
+        if (cmd === "stop_mcp") {
+          mcpRunning = false;
+        }
+        if (cmd === "stop_server") {
+          serverRunning = false;
+        }
       } catch (e) {
         log(String(e), "error");
       }
     }
-    serverRunning = false;
-    mcpRunning = false;
     stopping = false;
   }
 
@@ -104,6 +240,7 @@
 
   function clearLogs() {
     logs = [];
+    followLogs = true;
   }
 </script>
 
@@ -119,8 +256,8 @@
     <div class="brand">
       <div class="brand-mark">
         <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
-          <path d="M9 1L16.5 5.5V12.5L9 17L1.5 12.5V5.5L9 1Z" stroke="#4a9eff" stroke-width="1.2" fill="none" />
-          <path d="M9 5L13 7.5V12.5L9 15L5 12.5V7.5L9 5Z" fill="#4a9eff" fill-opacity="0.15" stroke="#4a9eff" stroke-width="0.8" />
+          <path d="M9 1L16.5 5.5V12.5L9 17L1.5 12.5V5.5L9 1Z" stroke="currentColor" stroke-width="1.2" fill="none" />
+          <path d="M9 5L13 7.5V12.5L9 15L5 12.5V7.5L9 5Z" fill="currentColor" fill-opacity="0.15" stroke="currentColor" stroke-width="0.8" />
         </svg>
       </div>
       <div class="brand-text">
@@ -155,61 +292,60 @@
     </div>
   </header>
 
-  <div class="divider-h"></div>
+  <section class="workspace-grid">
+    <div class="control-stack">
+      <section class="config-section panel-card">
+        <span class="section-label">{$t("options.title")}</span>
 
-  <section class="config-section">
-    <span class="section-label">{$t("options.title")}</span>
+        <div class="config-grid">
+          <div class="field">
+            <label class="field-label" for="port-input">{$t("options.port")}</label>
+            <input id="port-input" type="number" bind:value={port} min="1024" max="65535" disabled={isRunning || launching} />
+          </div>
 
-    <div class="config-grid">
-      <div class="field">
-        <label class="field-label" for="port-input">{$t("options.port")}</label>
-        <input id="port-input" type="number" bind:value={port} min="1024" max="65535" disabled={isRunning || launching} />
-      </div>
+          <div class="field">
+            <span class="field-label">{$t("options.debug")}</span>
+            <button class="toggle" class:on={debug} disabled={isRunning || launching} on:click={() => (debug = !debug)} aria-pressed={debug}>
+              <span class="track-label off">{$t("options.off")}</span>
+              <span class="thumb"></span>
+              <span class="track-label on">{$t("options.on")}</span>
+            </button>
+          </div>
+        </div>
+      </section>
 
-      <div class="field">
-        <span class="field-label">{$t("options.debug")}</span>
-        <button class="toggle" class:on={debug} disabled={isRunning || launching} on:click={() => (debug = !debug)} aria-pressed={debug}>
-          <span class="track-label off">{$t("options.off")}</span>
-          <span class="thumb"></span>
-          <span class="track-label on">{$t("options.on")}</span>
-        </button>
-      </div>
+      <section class="action-section panel-card">
+        <span class="section-label">Control</span>
+
+        {#if !isRunning}
+          <button class="action-btn launch action-fill" on:click={launchAll} disabled={launching}>
+            {#if launching}
+              <span class="spinner"></span>
+              {$t("buttons.launching")}
+            {:else}
+              <svg width="11" height="11" viewBox="0 0 11 11" fill="currentColor">
+                <path d="M2 1.5l7 4-7 4V1.5z" />
+              </svg>
+              {$t("buttons.launch")}
+            {/if}
+          </button>
+        {:else}
+          <button class="action-btn stop action-fill" on:click={stopAll} disabled={stopping}>
+            {#if stopping}
+              <span class="spinner"></span>
+              {$t("buttons.stopping")}
+            {:else}
+              <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
+                <rect x="1" y="1" width="8" height="8" rx="1" />
+              </svg>
+              {$t("buttons.stop")}
+            {/if}
+          </button>
+        {/if}
+      </section>
     </div>
-  </section>
 
-  <div class="divider-h"></div>
-
-  <section class="action-section">
-    {#if !isRunning}
-      <button class="action-btn launch" on:click={launchAll} disabled={launching}>
-        {#if launching}
-          <span class="spinner"></span>
-          {$t("buttons.launching")}
-        {:else}
-          <svg width="11" height="11" viewBox="0 0 11 11" fill="currentColor">
-            <path d="M2 1.5l7 4-7 4V1.5z" />
-          </svg>
-          {$t("buttons.launch")}
-        {/if}
-      </button>
-    {:else}
-      <button class="action-btn stop" on:click={stopAll} disabled={stopping}>
-        {#if stopping}
-          <span class="spinner"></span>
-          {$t("buttons.stopping")}
-        {:else}
-          <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
-            <rect x="1" y="1" width="8" height="8" rx="1" />
-          </svg>
-          {$t("buttons.stop")}
-        {/if}
-      </button>
-    {/if}
-  </section>
-
-  <div class="divider-h"></div>
-
-  <section class="terminal-section">
+    <section class="terminal-section panel-card">
     <div class="term-header">
       <span class="section-label">{$t("terminal.title")}</span>
       <div class="term-header-right">
@@ -218,6 +354,9 @@
           <button class="tab-btn" class:active={activeTab === "health"} on:click={() => (activeTab = "health")}>Server Health</button>
         </div>
         <div class="term-actions">
+          <button class="ghost-btn" class:active={followLogs} on:click={toggleFollowLogs}>
+            {followLogs ? "Following logs" : "Paused"}
+          </button>
           <button class="ghost-btn" on:click={healthCheck} disabled={checking || !isRunning}>
             {#if checking}
               <span class="spinner sm"></span>
@@ -234,11 +373,14 @@
     </div>
 
     {#if activeTab === "terminal"}
-      <div id="terminal" class="terminal">
-        {#each logs as entry (entry.ts + entry.msg)}
+      <div bind:this={terminalEl} class="terminal" on:scroll={handleTerminalScroll}>
+        {#each logs as entry (entry.id)}
           <div class="log-line {entry.type}" in:fly={{ y: 4, duration: 120 }}>
             <span class="log-ts">{entry.ts}</span>
             <span class="log-msg">{entry.msg}</span>
+            {#if entry.count && entry.count > 1}
+              <span class="log-repeat">x{entry.count}</span>
+            {/if}
           </div>
         {/each}
         {#if logs.length === 0}
@@ -252,17 +394,21 @@
       <HealthInspector data={healthData} loading={checking} error={healthError} />
     {/if}
   </section>
+  </section>
 </main>
 
 <style>
   :global(:root) {
     --bg: #080c10;
     --surface: #0d1219;
+    --surface-strong: #0d1219;
     --border: #151d28;
-    --border-hi: #1e2d3d;
+    --border-hi: #203548;
     --text-1: #c5d0db;
     --text-2: #6a7f94;
     --text-3: #3a4d5e;
+    --primary: #4a9eff;
+    --secondary: #203548;
     --accent: #4a9eff;
     --accent-lo: rgba(74, 158, 255, 0.08);
     --green: #39d353;
@@ -280,7 +426,10 @@
   }
 
   :global(body) {
-    background: var(--bg);
+    background:
+      radial-gradient(circle at top left, color-mix(in srgb, var(--primary) 18%, transparent), transparent 28%),
+      radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 14%, transparent), transparent 24%),
+      linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, black), var(--bg));
     color: var(--text-1);
     font-family: var(--font-sans);
     font-size: 13px;
@@ -289,19 +438,37 @@
   }
 
   main {
-    max-width: 820px;
+    width: min(1500px, calc(100vw - 2rem));
     margin: 0 auto;
-    padding: 2rem 1.75rem;
+    padding: 2rem 0 2.5rem;
     display: flex;
     flex-direction: column;
-    gap: 0;
+    gap: 1.25rem;
     min-height: 100vh;
   }
 
-  .divider-h {
-    height: 1px;
-    background: var(--border);
-    margin: 1.5rem 0;
+  .workspace-grid {
+    display: grid;
+    grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+    gap: 1.25rem;
+    align-items: start;
+    min-height: 0;
+    flex: 1;
+  }
+
+  .control-stack {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+  }
+
+  .panel-card {
+    background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, white), var(--surface));
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 1.1rem 1.15rem;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
+    backdrop-filter: blur(10px);
   }
 
   header {
@@ -318,6 +485,7 @@
 
   .brand-mark {
     flex-shrink: 0;
+    color: var(--accent);
   }
 
   .brand-text {
@@ -446,7 +614,7 @@
   input[type="number"] {
     width: 100%;
     padding: 0.5rem 0.65rem;
-    background: var(--surface);
+    background: color-mix(in srgb, var(--surface) 85%, black);
     border: 1px solid var(--border);
     border-radius: var(--r);
     color: var(--text-1);
@@ -468,7 +636,7 @@
     display: inline-flex;
     align-items: center;
     height: 32px;
-    background: var(--surface);
+    background: color-mix(in srgb, var(--surface) 85%, black);
     border: 1px solid var(--border);
     border-radius: var(--r);
     cursor: pointer;
@@ -480,7 +648,7 @@
   }
 
   .toggle.on {
-    border-color: rgba(74, 158, 255, 0.3);
+    border-color: color-mix(in srgb, var(--primary) 45%, transparent);
   }
 
   .toggle:disabled {
@@ -514,7 +682,7 @@
   }
 
   .toggle.on .track-label.on {
-    color: var(--accent);
+    color: var(--primary);
   }
 
   .thumb {
@@ -532,11 +700,13 @@
 
   .toggle.on .thumb {
     transform: translateX(calc(100% + 2px));
-    background: rgba(74, 158, 255, 0.15);
+    background: color-mix(in srgb, var(--primary) 18%, transparent);
   }
 
   .action-section {
     display: flex;
+    flex-direction: column;
+    gap: 1rem;
     justify-content: flex-start;
   }
 
@@ -566,13 +736,13 @@
 
   .action-btn.launch {
     background: var(--accent-lo);
-    border-color: rgba(74, 158, 255, 0.25);
-    color: var(--accent);
+    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+    color: var(--primary);
   }
 
   .action-btn.launch:hover:not(:disabled) {
-    background: rgba(74, 158, 255, 0.14);
-    border-color: rgba(74, 158, 255, 0.45);
+    background: color-mix(in srgb, var(--primary) 16%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 54%, transparent);
   }
 
   .action-btn.stop {
@@ -584,6 +754,12 @@
   .action-btn.stop:hover:not(:disabled) {
     background: rgba(244, 112, 103, 0.14);
     border-color: rgba(244, 112, 103, 0.4);
+  }
+
+  .action-fill {
+    width: 100%;
+    justify-content: center;
+    min-height: 44px;
   }
 
   .spinner {
@@ -614,6 +790,7 @@
     flex-direction: column;
     gap: 0.85rem;
     flex: 1;
+    min-width: 0;
   }
 
   .term-header {
@@ -655,7 +832,7 @@
   }
 
   .tab-btn.active {
-    background: rgba(74, 158, 255, 0.12);
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
     color: var(--accent);
   }
 
@@ -687,19 +864,24 @@
     border-color: var(--border-hi);
   }
 
+  .ghost-btn.active {
+    color: var(--accent);
+    border-color: color-mix(in srgb, var(--accent) 28%, transparent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+  }
+
   .ghost-btn:disabled {
     opacity: 0.3;
     cursor: not-allowed;
   }
 
   .terminal {
-    background: var(--surface);
+    background: color-mix(in srgb, var(--surface) 88%, black);
     border: 1px solid var(--border);
     border-radius: var(--r);
-    height: 260px;
+    height: clamp(360px, 62vh, 820px);
     overflow-y: auto;
     padding: 0.85rem 1rem;
-    scroll-behavior: smooth;
   }
 
   .terminal::-webkit-scrollbar {
@@ -734,8 +916,14 @@
   .log-msg {
     color: var(--text-1);
     white-space: pre-wrap;
-    word-break: break-all;
+    word-break: break-word;
     flex: 1;
+  }
+
+  .log-repeat {
+    color: var(--text-3);
+    flex-shrink: 0;
+    font-size: 0.68rem;
   }
 
   .log-line.success .log-msg {
@@ -760,7 +948,8 @@
 
   @media (max-width: 700px) {
     main {
-      padding: 1.25rem 1rem;
+      width: calc(100vw - 1rem);
+      padding: 1rem 0 1.5rem;
     }
 
     header,
@@ -771,22 +960,32 @@
       align-items: stretch;
     }
 
-    .config-grid,
-    .tab-row,
-    .term-actions {
+    .workspace-grid {
       grid-template-columns: 1fr;
-      justify-content: stretch;
     }
 
     .term-actions,
     .tab-row {
       width: 100%;
+      flex-wrap: wrap;
+    }
+
+    .config-grid {
+      grid-template-columns: 1fr;
     }
 
     .tab-btn,
     .ghost-btn {
       flex: 1;
       justify-content: center;
+    }
+
+    .panel-card {
+      padding: 0.95rem;
+    }
+
+    .terminal {
+      height: min(58vh, 560px);
     }
   }
 </style>
