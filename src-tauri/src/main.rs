@@ -12,6 +12,12 @@ use std::time::{Duration, Instant};
 #[allow(unused_imports)]
 use tauri::{Emitter, Manager, State};
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x08000000;
+
 struct AppState {
     server_process: Mutex<Option<Child>>,
     mcp_process: Mutex<Option<Child>>,
@@ -112,6 +118,9 @@ fn configure_bundled_python_env(
         .join("Lib")
         .join("site-packages");
     let scripts_dir = cybrtech_dir.join("cybrtech-env").join("Scripts");
+    let pywin32_system32 = site_packages.join("pywin32_system32");
+    let win32_dir = site_packages.join("win32");
+    let win32_lib_dir = win32_dir.join("lib");
 
     if !site_packages.exists() {
         return Err(format!(
@@ -120,7 +129,7 @@ fn configure_bundled_python_env(
         ));
     }
 
-    let mut paths = vec![runtime_dir.to_path_buf(), scripts_dir];
+    let mut paths = vec![runtime_dir.to_path_buf(), scripts_dir, pywin32_system32];
     if let Some(existing_path) = env::var_os("PATH") {
         paths.extend(env::split_paths(&existing_path));
     }
@@ -128,11 +137,15 @@ fn configure_bundled_python_env(
     let joined_path =
         env::join_paths(paths).map_err(|e| format!("Failed to prepare Python PATH: {e}"))?;
 
+    let python_paths = env::join_paths([site_packages, win32_dir, win32_lib_dir])
+        .map_err(|e| format!("Failed to prepare PYTHONPATH: {e}"))?;
+
     cmd.env("PATH", joined_path)
         .env("PYTHONHOME", runtime_dir)
-        .env("PYTHONPATH", &site_packages)
+        .env("PYTHONPATH", python_paths)
         .env("PYTHONIOENCODING", "utf-8")
-        .env("PYTHONUTF8", "1");
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONNOUSERSITE", "1");
 
     Ok(())
 }
@@ -262,6 +275,13 @@ fn stop_child_process(child: &mut Child, label: &str) -> Result<String, String> 
     Ok(format!("{label} stopped"))
 }
 
+fn configure_background_process(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 fn generate_internal_api_token(port: u16) -> String {
     let nonce = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -384,6 +404,8 @@ async fn launch_all(
             configure_bundled_python_env(&mut command, runtime_dir, &base)?;
         }
 
+        configure_background_process(&mut command);
+
         let mut child = command
             .spawn()
             .map_err(|e| format!("Failed to start server: {e}"))?;
@@ -417,6 +439,8 @@ async fn launch_all(
         if let Some(runtime_dir) = runtime_dir.as_deref() {
             configure_bundled_python_env(&mut command, runtime_dir, &base)?;
         }
+
+        configure_background_process(&mut command);
 
         let mut child = command
             .spawn()
