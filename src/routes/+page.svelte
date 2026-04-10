@@ -22,11 +22,12 @@
   let activeTab: "terminal" | "health" = "terminal";
 
   let serverRunning = false;
+  let serverHealthy = false;
   let mcpRunning = false;
   let healthData: Record<string, JsonValue> | null = null;
   let healthError = "";
 
-  $: isRunning = serverRunning && mcpRunning;
+  $: isRunning = serverRunning || mcpRunning;
 
   type LogType = "info" | "success" | "error" | "warn" | "muted" | "cmd";
 
@@ -44,6 +45,12 @@
     message: string;
   }
 
+  interface RuntimeStatus {
+    server_running: boolean;
+    server_healthy: boolean;
+    mcp_running: boolean;
+  }
+
   let logs: LogEntry[] = [];
   let terminalEl: HTMLDivElement | null = null;
   let followLogs = true;
@@ -51,13 +58,12 @@
   const MAX_LOGS = 400;
   const AUTO_SCROLL_THRESHOLD = 24;
   const READY_BANNER = [
-    "     ██████╗██╗   ██╗██████╗ ██████╗ ████████╗███████╗ ██████╗██╗  ██╗",
-    "    ██╔════╝╚██╗ ██╔╝██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██╔════╝██║  ██║",
-    "    ██║      ╚████╔╝ ██████╔╝██████╔╝   ██║   █████╗  ██║     ███████║",
-    "    ██║       ╚██╔╝  ██╔══██╗██╔══██╗   ██║   ██╔══╝  ██║     ██╔══██║",
-    "    ╚██████╗   ██║   ██████╔╝██║  ██║   ██║   ███████╗╚██████╗██║  ██║",
-    "     ╚═════╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚═════╝╚═╝  ╚═╝",
-    "                                                                      "
+    " ██████╗██╗   ██╗██████╗ ██████╗ ████████╗███████╗ ██████╗██╗  ██╗",
+    "██╔════╝╚██╗ ██╔╝██╔══██╗██╔══██╗╚══██╔══╝██╔════╝██╔════╝██║  ██║",
+    "██║      ╚████╔╝ ██████╔╝██████╔╝   ██║   █████╗  ██║     ███████║",
+    "██║       ╚██╔╝  ██╔══██╗██╔══██╗   ██║   ██╔══╝  ██║     ██╔══██║",
+    "╚██████╗   ██║   ██████╔╝██║  ██║   ██║   ███████╗╚██████╗██║  ██║",
+    " ╚═════╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝   ╚═╝   ╚══════╝ ╚═════╝╚═╝  ╚═╝",
   ].join("\n");
 
   onMount(() => {
@@ -65,8 +71,11 @@
     theme.init();
 
     let unlisten = () => {};
+    let statusTimer: ReturnType<typeof setInterval> | undefined;
 
     void (async () => {
+      await refreshRuntimeStatus();
+
       unlisten = await listen<ProcessLogEvent>("process-log", (event) => {
         const payload = event.payload;
         const cleanMessage = normalizeProcessLog(payload);
@@ -75,31 +84,52 @@
         const prefix = payload.source.toUpperCase();
         log(`[${prefix}] ${cleanMessage}`, classifyProcessLog(payload, cleanMessage));
       });
-
+      log(READY_BANNER, "info");
       log("Checking environment...", "cmd");
       try {
         const res = await invoke<string>("bootstrap");
         log(res === "bootstrapped" ? "Dependencies installed successfully" : "Environment ready", "success");
-        log(READY_BANNER, "info");
       } catch (e) {
         log(`Setup failed: ${e}`, "error");
       }
+
+      statusTimer = setInterval(() => {
+        void refreshRuntimeStatus();
+      }, 3000);
     })();
 
     return () => {
       unlisten();
+      if (statusTimer) clearInterval(statusTimer);
     };
   });
+
+  async function refreshRuntimeStatus(writeLog = false) {
+    try {
+      const status = await invoke<RuntimeStatus>("runtime_status", { port });
+      serverRunning = status.server_running;
+      serverHealthy = status.server_healthy;
+      mcpRunning = status.mcp_running;
+
+      if (writeLog) {
+        log(`Runtime status: server ${status.server_healthy ? "online" : status.server_running ? "starting" : "offline"}, MCP ${status.mcp_running ? "online" : "offline"}`, "info");
+      }
+    } catch (e) {
+      serverRunning = false;
+      serverHealthy = false;
+      mcpRunning = false;
+      if (writeLog) {
+        log(`Status refresh failed: ${e}`, "warn");
+      }
+    }
+  }
 
   function log(msg: string, type: LogType = "info") {
     const ts = new Date().toLocaleTimeString("en-GB", { hour12: false });
     const lastEntry = logs.at(-1);
 
     if (lastEntry && lastEntry.msg === msg && lastEntry.type === type) {
-      logs = [
-        ...logs.slice(0, -1),
-        { ...lastEntry, count: (lastEntry.count ?? 1) + 1, ts }
-      ];
+      logs = [...logs.slice(0, -1), { ...lastEntry, count: (lastEntry.count ?? 1) + 1, ts }];
     } else {
       logs = [...logs, { id: nextLogId++, ts, msg, type }];
       if (logs.length > MAX_LOGS) {
@@ -193,12 +223,11 @@
     log(`init cybrtech -> :${port}${debug ? " --debug" : ""}`, "cmd");
     try {
       const res: string = await invoke("launch_all", { debug, port });
-      serverRunning = true;
-      mcpRunning = true;
       log(res, "success");
     } catch (e) {
       log(String(e), "error");
     }
+    await refreshRuntimeStatus();
     launching = false;
   }
 
@@ -208,17 +237,25 @@
       try {
         const res: string = await invoke(cmd);
         log(res, "warn");
-        if (cmd === "stop_mcp") {
-          mcpRunning = false;
-        }
-        if (cmd === "stop_server") {
-          serverRunning = false;
-        }
       } catch (e) {
-        log(String(e), "error");
+        log(String(e), "warn");
       }
     }
+    await refreshRuntimeStatus();
     stopping = false;
+  }
+
+  async function restartServer() {
+    launching = true;
+    log(`restart cybrtech -> :${port}${debug ? " --debug" : ""}`, "cmd");
+    try {
+      const res: string = await invoke("restart_server", { debug, port });
+      log(res, "success");
+    } catch (e) {
+      log(String(e), "error");
+    }
+    await refreshRuntimeStatus();
+    launching = false;
   }
 
   async function healthCheck() {
@@ -235,6 +272,7 @@
       activeTab = "health";
       log(String(e), "error");
     }
+    await refreshRuntimeStatus();
     checking = false;
   }
 
@@ -257,7 +295,7 @@
       <div class="brand-mark">
         <svg width="18" height="18" viewBox="0 0 18 18" fill="none">
           <path d="M9 1L16.5 5.5V12.5L9 17L1.5 12.5V5.5L9 1Z" stroke="currentColor" stroke-width="1.2" fill="none" />
-          <path d="M9 5L13 7.5V12.5L9 15L5 12.5V7.5L9 5Z" fill="currentColor" fill-opacity="0.15" stroke="currentColor" stroke-width="0.8" />
+          <!-- <path d="M9 5L13 7.5V12.5L9 15L5 12.5V7.5L9 5Z" fill="currentColor" fill-opacity="0.15" stroke="currentColor" stroke-width="0.8" /> -->
         </svg>
       </div>
       <div class="brand-text">
@@ -268,14 +306,14 @@
 
     <div class="header-right">
       <div class="status-row">
-        <div class="status-item" class:active={serverRunning}>
+        <div class="status-item" class:active={serverHealthy}>
           <span class="status-dot"></span>
-          <span class="status-label">{$t("status.server")}</span>
+          <span class="status-label">{$t("status.server")} {serverHealthy ? "Online" : serverRunning ? "Starting" : "Offline"}</span>
         </div>
         <div class="status-sep">/</div>
         <div class="status-item" class:active={mcpRunning}>
           <span class="status-dot"></span>
-          <span class="status-label">{$t("status.mcp")}</span>
+          <span class="status-label">{$t("status.mcp")} {mcpRunning ? "Online" : "Offline"}</span>
         </div>
       </div>
 
@@ -330,91 +368,107 @@
             {/if}
           </button>
         {:else}
-          <button class="action-btn stop action-fill" on:click={stopAll} disabled={stopping}>
-            {#if stopping}
-              <span class="spinner"></span>
-              {$t("buttons.stopping")}
-            {:else}
-              <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
-                <rect x="1" y="1" width="8" height="8" rx="1" />
-              </svg>
-              {$t("buttons.stop")}
-            {/if}
-          </button>
+          <div class="action-group">
+            <button class="action-btn launch action-fill" on:click={restartServer} disabled={launching || stopping}>
+              {#if launching}
+                <span class="spinner"></span>
+                Restarting…
+              {:else}
+                <svg width="12" height="12" viewBox="0 0 12 12" fill="none">
+                  <path d="M10 2.6V5.4H7.2" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+                  <path d="M9.6 6A3.8 3.8 0 1 1 8.45 3.3L10 4.6" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                Restart Server
+              {/if}
+            </button>
+
+            <button class="action-btn stop action-fill" on:click={stopAll} disabled={stopping || launching}>
+              {#if stopping}
+                <span class="spinner"></span>
+                {$t("buttons.stopping")}
+              {:else}
+                <svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor">
+                  <rect x="1" y="1" width="8" height="8" rx="1" />
+                </svg>
+                {$t("buttons.stop")}
+              {/if}
+            </button>
+          </div>
         {/if}
       </section>
     </div>
 
     <section class="terminal-section panel-card">
-    <div class="term-header">
-      <span class="section-label">{$t("terminal.title")}</span>
-      <div class="term-header-right">
-        <div class="tab-row">
-          <button class="tab-btn" class:active={activeTab === "terminal"} on:click={() => (activeTab = "terminal")}>Terminal</button>
-          <button class="tab-btn" class:active={activeTab === "health"} on:click={() => (activeTab = "health")}>Server Health</button>
-        </div>
-        <div class="term-actions">
-          <button class="ghost-btn" class:active={followLogs} on:click={toggleFollowLogs}>
-            {followLogs ? "Following logs" : "Paused"}
-          </button>
-          <button class="ghost-btn" on:click={healthCheck} disabled={checking || !isRunning}>
-            {#if checking}
-              <span class="spinner sm"></span>
-            {:else}
-              <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
-                <path d="M1 5.5h2l1.5-3 2 6 1.5-3H10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
-              </svg>
-            {/if}
-            {$t("buttons.health")}
-          </button>
-          <button class="ghost-btn" on:click={clearLogs}>{$t("buttons.clear")}</button>
+      <div class="term-header">
+        <span class="section-label">{$t("terminal.title")}</span>
+        <div class="term-header-right">
+          <div class="tab-row">
+            <button class="tab-btn" class:active={activeTab === "terminal"} on:click={() => (activeTab = "terminal")}>Terminal</button>
+            <button class="tab-btn" class:active={activeTab === "health"} on:click={() => (activeTab = "health")}>Server Health</button>
+          </div>
+          <div class="term-actions">
+            <button class="ghost-btn" class:active={followLogs} on:click={toggleFollowLogs}>
+              {followLogs ? "Following logs" : "Paused"}
+            </button>
+            <button class="ghost-btn" on:click={healthCheck} disabled={checking || !isRunning}>
+              {#if checking}
+                <span class="spinner sm"></span>
+              {:else}
+                <svg width="11" height="11" viewBox="0 0 11 11" fill="none">
+                  <path d="M1 5.5h2l1.5-3 2 6 1.5-3H10" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+              {/if}
+              {$t("buttons.health")}
+            </button>
+            <button class="ghost-btn" on:click={clearLogs}>{$t("buttons.clear")}</button>
+          </div>
         </div>
       </div>
-    </div>
 
-    {#if activeTab === "terminal"}
-      <div bind:this={terminalEl} class="terminal" on:scroll={handleTerminalScroll}>
-        {#each logs as entry (entry.id)}
-          <div class="log-line {entry.type}" in:fly={{ y: 4, duration: 120 }}>
-            <span class="log-ts">{entry.ts}</span>
-            <span class="log-msg">{entry.msg}</span>
-            {#if entry.count && entry.count > 1}
-              <span class="log-repeat">x{entry.count}</span>
-            {/if}
-          </div>
-        {/each}
-        {#if logs.length === 0}
-          <div class="log-line muted">
-            <span class="log-ts">-</span>
-            <span class="log-msg">{$t("terminal.empty")}</span>
-          </div>
-        {/if}
-      </div>
-    {:else}
-      <HealthInspector data={healthData} loading={checking} error={healthError} />
-    {/if}
-  </section>
+      {#if activeTab === "terminal"}
+        <div bind:this={terminalEl} class="terminal" on:scroll={handleTerminalScroll}>
+          {#each logs as entry (entry.id)}
+            <div class="log-line {entry.type}" in:fly={{ y: 4, duration: 120 }}>
+              <span class="log-ts">{entry.ts}</span>
+              <span class="log-msg">{entry.msg}</span>
+              {#if entry.count && entry.count > 1}
+                <span class="log-repeat">x{entry.count}</span>
+              {/if}
+            </div>
+          {/each}
+          {#if logs.length === 0}
+            <div class="log-line muted">
+              <span class="log-ts">-</span>
+              <span class="log-msg">{$t("terminal.empty")}</span>
+            </div>
+          {/if}
+        </div>
+      {:else}
+        <HealthInspector data={healthData} loading={checking} error={healthError} />
+      {/if}
+    </section>
   </section>
 </main>
 
 <style>
   :global(:root) {
-    --bg: #080c10;
-    --surface: #0d1219;
-    --surface-strong: #0d1219;
-    --border: #151d28;
-    --border-hi: #203548;
-    --text-1: #c5d0db;
-    --text-2: #6a7f94;
-    --text-3: #3a4d5e;
-    --primary: #4a9eff;
-    --secondary: #203548;
-    --accent: #4a9eff;
-    --accent-lo: rgba(74, 158, 255, 0.08);
-    --green: #39d353;
-    --red: #f47067;
-    --yellow: #e3b341;
+    --bg: #0b1015;
+    --surface: #10161d;
+    --surface-strong: #151c24;
+    --border: #25303a;
+    --border-hi: #334250;
+    --text-1: #d6dee7;
+    --text-2: #93a2b2;
+    --text-3: #667789;
+    --primary: #87b7ff;
+    --secondary: #334250;
+    --accent: #8fd8ea;
+    --accent-lo: rgba(143, 216, 234, 0.1);
+    --green: #73c991;
+    --red: #e28a84;
+    --yellow: #d7bf71;
     --font-mono: "IBM Plex Mono", "Cascadia Code", monospace;
+    --font-terminal: "Cascadia Mono", "Cascadia Code", "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, "Liberation Mono", monospace;
     --font-sans: "IBM Plex Sans", system-ui, sans-serif;
     --r: 6px;
   }
@@ -426,10 +480,7 @@
   }
 
   :global(body) {
-    background:
-      radial-gradient(circle at top left, color-mix(in srgb, var(--primary) 18%, transparent), transparent 28%),
-      radial-gradient(circle at top right, color-mix(in srgb, var(--accent) 14%, transparent), transparent 24%),
-      linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, black), var(--bg));
+    background: linear-gradient(180deg, color-mix(in srgb, var(--bg) 92%, black), var(--bg));
     color: var(--text-1);
     font-family: var(--font-sans);
     font-size: 13px;
@@ -438,19 +489,19 @@
   }
 
   main {
-    width: min(1500px, calc(100vw - 2rem));
+    width: min(1320px, calc(100vw - 2rem));
     margin: 0 auto;
-    padding: 2rem 0 2.5rem;
+    padding: 1.35rem 0 1.75rem;
     display: flex;
     flex-direction: column;
-    gap: 1.25rem;
+    gap: 1rem;
     min-height: 100vh;
   }
 
   .workspace-grid {
     display: grid;
-    grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
-    gap: 1.25rem;
+    grid-template-columns: minmax(250px, 310px) minmax(0, 1fr);
+    gap: 1rem;
     align-items: start;
     min-height: 0;
     flex: 1;
@@ -459,28 +510,28 @@
   .control-stack {
     display: flex;
     flex-direction: column;
-    gap: 1.25rem;
+    gap: 0.85rem;
   }
 
   .panel-card {
-    background: linear-gradient(180deg, color-mix(in srgb, var(--surface) 92%, white), var(--surface));
+    background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 14px;
-    padding: 1.1rem 1.15rem;
-    box-shadow: 0 20px 60px rgba(0, 0, 0, 0.18);
-    backdrop-filter: blur(10px);
+    border-radius: 12px;
+    padding: 0.95rem 1rem;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.16);
   }
 
   header {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    padding: 0.1rem 0;
   }
 
   .brand {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.65rem;
   }
 
   .brand-mark {
@@ -496,24 +547,24 @@
 
   .brand-name {
     font-family: var(--font-mono);
-    font-size: 0.88rem;
+    font-size: 0.82rem;
     font-weight: 600;
     color: var(--text-1);
-    letter-spacing: 0.06em;
+    letter-spacing: 0.04em;
   }
 
   .brand-sub {
     font-family: var(--font-mono);
-    font-size: 0.62rem;
+    font-size: 0.58rem;
     color: var(--text-3);
-    letter-spacing: 0.08em;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
   }
 
   .header-right {
     display: flex;
     align-items: center;
-    gap: 1rem;
+    gap: 0.7rem;
   }
 
   .status-row {
@@ -521,8 +572,8 @@
     align-items: center;
     gap: 0.5rem;
     font-family: var(--font-mono);
-    font-size: 0.68rem;
-    letter-spacing: 0.06em;
+    font-size: 0.64rem;
+    letter-spacing: 0.05em;
   }
 
   .status-sep {
@@ -550,15 +601,15 @@
   }
 
   .status-item.active .status-dot {
-    box-shadow: 0 0 6px var(--green);
+    box-shadow: 0 0 0 3px color-mix(in srgb, var(--green) 18%, transparent);
   }
 
   .icon-btn {
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 30px;
-    height: 30px;
+    width: 32px;
+    height: 32px;
     border-radius: var(--r);
     border: 1px solid var(--border);
     background: transparent;
@@ -578,8 +629,8 @@
 
   .section-label {
     font-family: var(--font-mono);
-    font-size: 0.62rem;
-    letter-spacing: 0.12em;
+    font-size: 0.58rem;
+    letter-spacing: 0.1em;
     text-transform: uppercase;
     color: var(--text-3);
     display: block;
@@ -588,13 +639,13 @@
   .config-section {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: 0.8rem;
   }
 
   .config-grid {
     display: grid;
     grid-template-columns: 1fr 1fr;
-    gap: 1rem;
+    gap: 0.8rem;
   }
 
   .field {
@@ -605,7 +656,7 @@
 
   .field-label {
     font-family: var(--font-mono);
-    font-size: 0.65rem;
+    font-size: 0.62rem;
     letter-spacing: 0.08em;
     text-transform: uppercase;
     color: var(--text-2);
@@ -613,8 +664,8 @@
 
   input[type="number"] {
     width: 100%;
-    padding: 0.5rem 0.65rem;
-    background: color-mix(in srgb, var(--surface) 85%, black);
+    padding: 0.52rem 0.65rem;
+    background: color-mix(in srgb, var(--surface-strong) 92%, black);
     border: 1px solid var(--border);
     border-radius: var(--r);
     color: var(--text-1);
@@ -636,7 +687,7 @@
     display: inline-flex;
     align-items: center;
     height: 32px;
-    background: color-mix(in srgb, var(--surface) 85%, black);
+    background: color-mix(in srgb, var(--surface-strong) 92%, black);
     border: 1px solid var(--border);
     border-radius: var(--r);
     cursor: pointer;
@@ -706,7 +757,7 @@
   .action-section {
     display: flex;
     flex-direction: column;
-    gap: 1rem;
+    gap: 0.8rem;
     justify-content: flex-start;
   }
 
@@ -714,10 +765,10 @@
     display: inline-flex;
     align-items: center;
     gap: 0.55rem;
-    padding: 0.6rem 1.4rem;
+    padding: 0.65rem 1rem;
     font-family: var(--font-mono);
-    font-size: 0.78rem;
-    letter-spacing: 0.06em;
+    font-size: 0.74rem;
+    letter-spacing: 0.04em;
     font-weight: 500;
     border: 1px solid transparent;
     border-radius: var(--r);
@@ -735,8 +786,8 @@
   }
 
   .action-btn.launch {
-    background: var(--accent-lo);
-    border-color: color-mix(in srgb, var(--primary) 28%, transparent);
+    background: color-mix(in srgb, var(--primary) 9%, transparent);
+    border-color: color-mix(in srgb, var(--primary) 22%, transparent);
     color: var(--primary);
   }
 
@@ -746,8 +797,8 @@
   }
 
   .action-btn.stop {
-    background: rgba(244, 112, 103, 0.08);
-    border-color: rgba(244, 112, 103, 0.2);
+    background: rgba(226, 138, 132, 0.08);
+    border-color: rgba(226, 138, 132, 0.18);
     color: var(--red);
   }
 
@@ -788,7 +839,7 @@
   .terminal-section {
     display: flex;
     flex-direction: column;
-    gap: 0.85rem;
+    gap: 0.7rem;
     flex: 1;
     min-width: 0;
   }
@@ -797,23 +848,23 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    gap: 1rem;
+    gap: 0.8rem;
   }
 
   .term-header-right {
     display: flex;
     align-items: center;
-    gap: 0.75rem;
+    gap: 0.55rem;
   }
 
   .tab-row {
     display: inline-flex;
     align-items: center;
-    gap: 0.35rem;
-    padding: 0.2rem;
+    gap: 0.25rem;
+    padding: 0.18rem;
     border: 1px solid var(--border);
     border-radius: var(--r);
-    background: rgba(255, 255, 255, 0.02);
+    background: transparent;
   }
 
   .tab-btn {
@@ -821,9 +872,9 @@
     background: transparent;
     color: var(--text-2);
     font-family: var(--font-mono);
-    font-size: 0.67rem;
-    letter-spacing: 0.06em;
-    padding: 0.35rem 0.6rem;
+    font-size: 0.63rem;
+    letter-spacing: 0.04em;
+    padding: 0.32rem 0.58rem;
     border-radius: 4px;
     cursor: pointer;
     transition:
@@ -832,23 +883,23 @@
   }
 
   .tab-btn.active {
-    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
     color: var(--accent);
   }
 
   .term-actions {
     display: flex;
-    gap: 0.4rem;
+    gap: 0.35rem;
   }
 
   .ghost-btn {
     display: inline-flex;
     align-items: center;
     gap: 0.4rem;
-    padding: 0.3rem 0.7rem;
+    padding: 0.34rem 0.62rem;
     font-family: var(--font-mono);
-    font-size: 0.67rem;
-    letter-spacing: 0.06em;
+    font-size: 0.63rem;
+    letter-spacing: 0.04em;
     background: transparent;
     border: 1px solid var(--border);
     border-radius: var(--r);
@@ -866,8 +917,8 @@
 
   .ghost-btn.active {
     color: var(--accent);
-    border-color: color-mix(in srgb, var(--accent) 28%, transparent);
-    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 22%, transparent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
   }
 
   .ghost-btn:disabled {
@@ -876,12 +927,14 @@
   }
 
   .terminal {
-    background: color-mix(in srgb, var(--surface) 88%, black);
+    background: color-mix(in srgb, var(--surface-strong) 92%, black);
     border: 1px solid var(--border);
     border-radius: var(--r);
     height: clamp(360px, 62vh, 820px);
     overflow-y: auto;
-    padding: 0.85rem 1rem;
+    padding: 0.75rem 0.85rem;
+    font-family: var(--font-terminal);
+    font-size: 0.72rem;
   }
 
   .terminal::-webkit-scrollbar {
@@ -899,17 +952,17 @@
 
   .log-line {
     display: flex;
-    gap: 1rem;
-    padding: 0.18rem 0;
-    font-family: var(--font-mono);
-    font-size: 0.75rem;
-    line-height: 1.6;
+    gap: 0.85rem;
+    padding: 0.16rem 0;
+    font-family: var(--font-terminal);
+    font-size: 0.72rem;
+    line-height: 1.45;
   }
 
   .log-ts {
     color: var(--text-3);
     flex-shrink: 0;
-    font-size: 0.7rem;
+    font-size: 0.64rem;
     padding-top: 1px;
   }
 
@@ -923,7 +976,7 @@
   .log-repeat {
     color: var(--text-3);
     flex-shrink: 0;
-    font-size: 0.68rem;
+    font-size: 0.62rem;
   }
 
   .log-line.success .log-msg {
@@ -949,7 +1002,7 @@
   @media (max-width: 700px) {
     main {
       width: calc(100vw - 1rem);
-      padding: 1rem 0 1.5rem;
+      padding: 0.85rem 0 1.2rem;
     }
 
     header,
@@ -981,7 +1034,7 @@
     }
 
     .panel-card {
-      padding: 0.95rem;
+      padding: 0.85rem;
     }
 
     .terminal {

@@ -30,6 +30,13 @@ struct ProcessLogEvent {
     message: String,
 }
 
+#[derive(Serialize)]
+struct RuntimeStatus {
+    server_running: bool,
+    server_healthy: bool,
+    mcp_running: bool,
+}
+
 /// Finds the first system Python executable available on PATH.
 fn find_python() -> Option<&'static str> {
     for candidate in &["py", "python", "python3"] {
@@ -296,6 +303,22 @@ fn rollback_managed_child(slot: &Mutex<Option<Child>>, label: &str) {
     }
 }
 
+/// Returns true if the child process in `slot` is still running.
+///
+/// Unlike the previous implementation, this function is intentionally
+/// non-mutating: it never clears the slot. Reaping an exited process is
+/// the responsibility of the stop/restart commands, not a status query.
+fn child_is_running(slot: &Mutex<Option<Child>>) -> Result<bool, String> {
+    let mut guard = slot.lock().unwrap();
+    match guard.as_mut() {
+        None => Ok(false),
+        Some(child) => match child.try_wait().map_err(|e| e.to_string())? {
+            Some(_) => Ok(false), // exited — leave the slot intact for callers to inspect
+            None => Ok(true),
+        },
+    }
+}
+
 #[tauri::command]
 async fn bootstrap(app: tauri::AppHandle) -> Result<String, String> {
     let base = resolve_cybrtech_path(&app)?;
@@ -460,31 +483,80 @@ async fn launch_all(
 }
 
 #[tauri::command]
-fn stop_server(state: State<AppState>) -> Result<String, String> {
-    let mut proc = state.server_process.lock().unwrap();
-    if let Some(mut child) = proc.take() {
-        return stop_child_process(&mut child, "Server");
+async fn stop_server(state: State<'_, AppState>) -> Result<String, String> {
+    let child = state.server_process.lock().unwrap().take();
+    match child {
+        None => Err("Server was not running".into()),
+        Some(mut child) => {
+            tauri::async_runtime::spawn_blocking(move || stop_child_process(&mut child, "Server"))
+                .await
+                .map_err(|e| format!("Task panicked: {e}"))?
+        }
     }
-    Err("Server was not running".into())
 }
 
 #[tauri::command]
-fn stop_mcp(state: State<AppState>) -> Result<String, String> {
-    let mut proc = state.mcp_process.lock().unwrap();
-    if let Some(mut child) = proc.take() {
-        return stop_child_process(&mut child, "MCP");
+async fn stop_mcp(state: State<'_, AppState>) -> Result<String, String> {
+    let child = state.mcp_process.lock().unwrap().take();
+    match child {
+        None => Err("MCP was not running".into()),
+        Some(mut child) => {
+            tauri::async_runtime::spawn_blocking(move || stop_child_process(&mut child, "MCP"))
+                .await
+                .map_err(|e| format!("Task panicked: {e}"))?
+        }
     }
-    Err("MCP was not running".into())
 }
 
 #[tauri::command]
-fn health_check(port: u16) -> Result<String, String> {
-    run_local_health_check(port)
+async fn runtime_status(port: u16, state: State<'_, AppState>) -> Result<RuntimeStatus, String> {
+    let server_running = child_is_running(&state.server_process)?;
+    let mcp_running = child_is_running(&state.mcp_process)?;
+    let server_healthy = if server_running {
+        tauri::async_runtime::spawn_blocking(move || run_local_health_check(port).is_ok())
+            .await
+            .unwrap_or(false)
+    } else {
+        false
+    };
+
+    Ok(RuntimeStatus {
+        server_running,
+        server_healthy,
+        mcp_running,
+    })
 }
 
 #[tauri::command]
-fn server_health(port: u16) -> Result<String, String> {
-    run_local_health_check(port)
+async fn restart_server(
+    debug: bool,
+    port: u16,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    if let Some(mut child) = state.mcp_process.lock().unwrap().take() {
+        let _ = stop_child_process(&mut child, "MCP");
+    }
+
+    if let Some(mut child) = state.server_process.lock().unwrap().take() {
+        let _ = stop_child_process(&mut child, "Server");
+    }
+
+    launch_all(debug, port, app, state).await
+}
+
+#[tauri::command]
+async fn health_check(port: u16) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_local_health_check(port))
+        .await
+        .map_err(|e| format!("Task panicked: {e}"))?
+}
+
+#[tauri::command]
+async fn server_health(port: u16) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || run_local_health_check(port))
+        .await
+        .map_err(|e| format!("Task panicked: {e}"))?
 }
 
 fn main() {
@@ -498,6 +570,8 @@ fn main() {
             launch_all,
             stop_server,
             stop_mcp,
+            runtime_status,
+            restart_server,
             health_check,
             server_health,
         ])
