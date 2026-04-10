@@ -222,9 +222,9 @@ fn resolve_python_command(
     let bundled_python_unix = runtime_dir.join("python");
     
     let bundled_python = if bundled_python_exe.exists() {
-        bundled_python_exe
+        bundled_python_exe.clone()
     } else if bundled_python_unix.exists() {
-        bundled_python_unix
+        bundled_python_unix.clone()
     } else {
         PathBuf::new() // Will fail in next check
     };
@@ -343,10 +343,10 @@ fn stop_child_process(child: &mut Child, label: &str) -> Result<String, String> 
     Ok(format!("{label} stopped"))
 }
 
-fn configure_background_process(command: &mut Command) {
+fn configure_background_process(_command: &mut Command) {
     #[cfg(windows)]
     {
-        command.creation_flags(CREATE_NO_WINDOW);
+        _command.creation_flags(CREATE_NO_WINDOW);
     }
 }
 
