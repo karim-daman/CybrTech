@@ -6,4 +6,9 @@
 # will have schema files for capabilities auto-completion
 /gen/schemas
 
+# Python virtual environments
+cybrtech-tools/cybrtech-env/
+cybrtech-tools/**/*.pyc
+cybrtech-tools/**/__pycache__/
+
 

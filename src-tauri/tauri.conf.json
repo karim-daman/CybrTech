@@ -31,8 +31,7 @@
     },
     "resources": [
       "cybrtech-tools/assets/**/*",
-      "cybrtech-tools/cybrtech-env/**/*",
-      "cybrtech-tools/cybrtech-tools-mcp.json",
+      "cybrtech-tools/cybrtech-mcp.json",
       "cybrtech-tools/cybrtech_mcp.py",
       "cybrtech-tools/cybrtech_server.py",
       "cybrtech-tools/LICENSE",
