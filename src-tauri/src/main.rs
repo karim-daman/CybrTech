@@ -183,12 +183,16 @@ fn ensure_executable(path: &Path) -> Result<(), String> {
             .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
         let mut perms = metadata.permissions();
         let mode = perms.mode();
-        // Set execute bit for owner, group, and others if not already set
-        if (mode & 0o111) == 0 {
-            perms.set_mode(mode | 0o111);
+        eprintln!("[DEBUG] Current permissions for {}: {:o}", path.display(), mode);
+        // Always set execute bits to be safe
+        let new_mode = mode | 0o755; // Owner: rwx, Group: rx, Others: rx
+        if mode != new_mode {
+            perms.set_mode(new_mode);
             fs::set_permissions(path, perms)
                 .map_err(|e| format!("Failed to set execute permissions on {}: {}", path.display(), e))?;
-            eprintln!("[DEBUG] Set execute permissions on {}", path.display());
+            eprintln!("[DEBUG] Set execute permissions on {} from {:o} to {:o}", path.display(), mode, new_mode);
+        } else {
+            eprintln!("[DEBUG] {} already has correct permissions", path.display());
         }
     }
     #[cfg(not(unix))]
@@ -470,6 +474,13 @@ async fn launch_all(
     let server_url = format!("http://127.0.0.1:{port}");
     let internal_api_token = generate_internal_api_token(port);
 
+    // Ensure Python executable has execute permissions before spawning any processes
+    eprintln!("[DEBUG] Ensuring Python executable has execute permissions: {}", python.display());
+    if !python.exists() {
+        return Err(format!("Python executable not found at: {}", python.display()));
+    }
+    ensure_executable(&python)?;
+
     if !python.exists() {
         return Err(format!(
             "Python runtime not found at {}. Run bootstrap first.",
@@ -503,9 +514,13 @@ async fn launch_all(
 
         configure_background_process(&mut command);
 
+        eprintln!("[DEBUG] Spawning server process with command: {:?}", python);
         let mut child = command
             .spawn()
-            .map_err(|e| format!("Failed to start server: {e}"))?;
+            .map_err(|e| {
+                eprintln!("[ERROR] Failed to spawn server. Python: {}, Error: {}", python.display(), e);
+                format!("Failed to start server: {e}")
+            })?;
         attach_child_logs(&app, &mut child, "server");
 
         *proc = Some(child);
@@ -539,10 +554,12 @@ async fn launch_all(
 
         configure_background_process(&mut command);
 
+        eprintln!("[DEBUG] Spawning MCP process with command: {:?}", python);
         let mut child = command
             .spawn()
             .map_err(|e| {
                 rollback_managed_child(&state.server_process, "Server");
+                eprintln!("[ERROR] Failed to spawn MCP. Python: {}, Error: {}", python.display(), e);
                 format!("Failed to start MCP: {e}")
             })?;
         attach_child_logs(&app, &mut child, "mcp");
