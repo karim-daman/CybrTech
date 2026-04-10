@@ -179,6 +179,15 @@ fn ensure_executable(path: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::fs;
+        
+        // On Unix, don't try to chmod Windows .exe files
+        if let Some(ext) = path.extension() {
+            if ext.eq_ignore_ascii_case("exe") {
+                eprintln!("[DEBUG] Skipping permission fix for Windows .exe file: {}", path.display());
+                return Ok(());
+            }
+        }
+        
         let metadata = fs::metadata(path)
             .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
         let mut perms = metadata.permissions();
@@ -217,16 +226,32 @@ fn resolve_python_command(
 
     let runtime_dir = resolve_python_runtime_path(app)?;
     
-    // Try python.exe first (Windows), then python (Unix)
-    let bundled_python_exe = runtime_dir.join("python.exe");
-    let bundled_python_unix = runtime_dir.join("python");
-    
-    let bundled_python = if bundled_python_exe.exists() {
-        bundled_python_exe.clone()
-    } else if bundled_python_unix.exists() {
-        bundled_python_unix.clone()
-    } else {
-        PathBuf::new() // Will fail in next check
+    // Platform-aware Python selection: prioritize the correct binary for the OS
+    let bundled_python = {
+        #[cfg(windows)]
+        {
+            let exe = runtime_dir.join("python.exe");
+            let unix = runtime_dir.join("python");
+            if exe.exists() {
+                exe
+            } else if unix.exists() {
+                unix
+            } else {
+                PathBuf::new()
+            }
+        }
+        #[cfg(unix)]
+        {
+            let unix = runtime_dir.join("python");
+            let exe = runtime_dir.join("python.exe");
+            if unix.exists() {
+                unix
+            } else if exe.exists() {
+                exe
+            } else {
+                PathBuf::new()
+            }
+        }
     };
     
     if bundled_python.exists() {
@@ -239,6 +264,8 @@ fn resolve_python_command(
         return Ok((venv_python, None));
     }
 
+    let bundled_python_exe = runtime_dir.join("python.exe");
+    let bundled_python_unix = runtime_dir.join("python");
     Err(format!(
         "No Python runtime is available. Expected either {} or {} or {}",
         venv_python.display(),
