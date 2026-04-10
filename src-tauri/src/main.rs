@@ -15,6 +15,9 @@ use tauri::{Emitter, Manager, State};
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
@@ -171,6 +174,30 @@ fn configure_bundled_python_env(
     Ok(())
 }
 
+/// Ensures a file has execute permissions on Unix systems
+fn ensure_executable(path: &Path) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::fs;
+        let metadata = fs::metadata(path)
+            .map_err(|e| format!("Failed to stat {}: {}", path.display(), e))?;
+        let mut perms = metadata.permissions();
+        let mode = perms.mode();
+        // Set execute bit for owner, group, and others if not already set
+        if (mode & 0o111) == 0 {
+            perms.set_mode(mode | 0o111);
+            fs::set_permissions(path, perms)
+                .map_err(|e| format!("Failed to set execute permissions on {}: {}", path.display(), e))?;
+            eprintln!("[DEBUG] Set execute permissions on {}", path.display());
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
+
 fn resolve_python_command(
     app: &tauri::AppHandle,
     cybrtech_dir: &Path,
@@ -180,23 +207,39 @@ fn resolve_python_command(
         .join("Scripts")
         .join("python.exe");
     if cfg!(debug_assertions) && venv_python.exists() {
+        ensure_executable(&venv_python).ok(); // Best effort
         return Ok((venv_python, None));
     }
 
     let runtime_dir = resolve_python_runtime_path(app)?;
-    let bundled_python = runtime_dir.join("python.exe");
+    
+    // Try python.exe first (Windows), then python (Unix)
+    let bundled_python_exe = runtime_dir.join("python.exe");
+    let bundled_python_unix = runtime_dir.join("python");
+    
+    let bundled_python = if bundled_python_exe.exists() {
+        bundled_python_exe
+    } else if bundled_python_unix.exists() {
+        bundled_python_unix
+    } else {
+        PathBuf::new() // Will fail in next check
+    };
+    
     if bundled_python.exists() {
+        ensure_executable(&bundled_python)?;
         return Ok((bundled_python, Some(runtime_dir)));
     }
 
     if venv_python.exists() {
+        ensure_executable(&venv_python).ok(); // Best effort
         return Ok((venv_python, None));
     }
 
     Err(format!(
-        "No Python runtime is available. Expected either {} or {}",
+        "No Python runtime is available. Expected either {} or {} or {}",
         venv_python.display(),
-        bundled_python.display()
+        bundled_python_exe.display(),
+        bundled_python_unix.display()
     ))
 }
 
@@ -338,13 +381,15 @@ async fn bootstrap(app: tauri::AppHandle) -> Result<String, String> {
     let base = resolve_cybrtech_path(&app)?;
     let venv_python = base.join("cybrtech-env").join("Scripts").join("python.exe");
     let bundled_runtime = resolve_python_runtime_path(&app)?;
-    let bundled_python = bundled_runtime.join("python.exe");
+    let bundled_python_exe = bundled_runtime.join("python.exe");
+    let bundled_python_unix = bundled_runtime.join("python");
     let bundled_site_packages = bundled_runtime.join("Lib").join("site-packages");
 
     eprintln!("[DEBUG] Bootstrap check:");
     eprintln!("  Base dir: {}", base.display());
     eprintln!("  Venv Python: {} (exists: {})", venv_python.display(), venv_python.exists());
-    eprintln!("  Bundled Python: {} (exists: {})", bundled_python.display(), bundled_python.exists());
+    eprintln!("  Bundled Python (exe): {} (exists: {})", bundled_python_exe.display(), bundled_python_exe.exists());
+    eprintln!("  Bundled Python (unix): {} (exists: {})", bundled_python_unix.display(), bundled_python_unix.exists());
     eprintln!("  Bundled site-packages: {} (exists: {})", bundled_site_packages.display(), bundled_site_packages.exists());
 
     // Either use local venv OR bundled Python runtime
@@ -352,15 +397,17 @@ async fn bootstrap(app: tauri::AppHandle) -> Result<String, String> {
         return Ok("ready".into());
     }
     
-    if bundled_python.exists() && bundled_site_packages.exists() {
+    let has_bundled_python = bundled_python_exe.exists() || bundled_python_unix.exists();
+    if has_bundled_python && bundled_site_packages.exists() {
         return Ok("ready".into());
     }
 
     #[cfg(not(debug_assertions))]
     {
         return Err(format!(
-            "Bundled Python runtime missing or incomplete. Expected:\n  Python: {}\n  Site-packages: {}\n\nPlease rebuild the app bundle to include python-runtime with all its components.",
-            bundled_python.display(),
+            "Bundled Python runtime missing or incomplete. Expected:\n  Python: {} or {}\n  Site-packages: {}\n\nPlease rebuild the app bundle to include python-runtime with all its components.",
+            bundled_python_exe.display(),
+            bundled_python_unix.display(),
             bundled_site_packages.display()
         ));
     }
