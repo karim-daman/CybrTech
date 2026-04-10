@@ -323,18 +323,31 @@ fn child_is_running(slot: &Mutex<Option<Child>>) -> Result<bool, String> {
 async fn bootstrap(app: tauri::AppHandle) -> Result<String, String> {
     let base = resolve_cybrtech_path(&app)?;
     let venv_python = base.join("cybrtech-env").join("Scripts").join("python.exe");
-    let bundled_python = resolve_python_runtime_path(&app)?.join("python.exe");
-    let bundled_site_packages = base.join("cybrtech-env").join("Lib").join("site-packages");
+    let bundled_runtime = resolve_python_runtime_path(&app)?;
+    let bundled_python = bundled_runtime.join("python.exe");
+    let bundled_site_packages = bundled_runtime.join("Lib").join("site-packages");
 
-    if venv_python.exists() || (bundled_python.exists() && bundled_site_packages.exists()) {
+    eprintln!("[DEBUG] Bootstrap check:");
+    eprintln!("  Base dir: {}", base.display());
+    eprintln!("  Venv Python: {} (exists: {})", venv_python.display(), venv_python.exists());
+    eprintln!("  Bundled Python: {} (exists: {})", bundled_python.display(), bundled_python.exists());
+    eprintln!("  Bundled site-packages: {} (exists: {})", bundled_site_packages.display(), bundled_site_packages.exists());
+
+    // Either use local venv OR bundled Python runtime
+    if venv_python.exists() {
+        return Ok("ready".into());
+    }
+    
+    if bundled_python.exists() && bundled_site_packages.exists() {
         return Ok("ready".into());
     }
 
     #[cfg(not(debug_assertions))]
     {
         return Err(format!(
-            "Bundled Python runtime missing at {}. Rebuild the app bundle with python-runtime included.",
-            bundled_python.display()
+            "Bundled Python runtime missing or incomplete. Expected:\n  Python: {}\n  Site-packages: {}\n\nPlease rebuild the app bundle to include python-runtime with all its components.",
+            bundled_python.display(),
+            bundled_site_packages.display()
         ));
     }
 
