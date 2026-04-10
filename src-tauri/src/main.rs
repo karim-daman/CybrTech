@@ -120,23 +120,37 @@ fn configure_bundled_python_env(
     runtime_dir: &Path,
     cybrtech_dir: &Path,
 ) -> Result<(), String> {
-    let site_packages = cybrtech_dir
+    // Try bundled runtime site-packages first, fall back to venv site-packages
+    let bundled_site_packages = runtime_dir.join("Lib").join("site-packages");
+    let venv_site_packages = cybrtech_dir
         .join("cybrtech-env")
         .join("Lib")
         .join("site-packages");
+    
+    let site_packages = if bundled_site_packages.exists() {
+        bundled_site_packages
+    } else if venv_site_packages.exists() {
+        venv_site_packages
+    } else {
+        return Err(format!(
+            "No site-packages found. Checked: {} and {}",
+            bundled_site_packages.display(),
+            venv_site_packages.display()
+        ));
+    };
+
     let scripts_dir = cybrtech_dir.join("cybrtech-env").join("Scripts");
     let pywin32_system32 = site_packages.join("pywin32_system32");
     let win32_dir = site_packages.join("win32");
     let win32_lib_dir = win32_dir.join("lib");
 
-    if !site_packages.exists() {
-        return Err(format!(
-            "Bundled site-packages not found at {}",
-            site_packages.display()
-        ));
+    let mut paths = vec![runtime_dir.to_path_buf(), pywin32_system32];
+    
+    // Only add scripts_dir if it exists (Windows dev mode)
+    if scripts_dir.exists() {
+        paths.insert(1, scripts_dir);
     }
-
-    let mut paths = vec![runtime_dir.to_path_buf(), scripts_dir, pywin32_system32];
+    
     if let Some(existing_path) = env::var_os("PATH") {
         paths.extend(env::split_paths(&existing_path));
     }
