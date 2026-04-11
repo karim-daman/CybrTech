@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.cybrtech",
   "build": {
-    "beforeDevCommand": "npm run dev",
+    "beforeDevCommand": "python setup-env.py --dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "python setup-env.py --build",
     "frontendDist": "../build"
   },
   "app": {
@@ -29,10 +29,27 @@
         "installerHooks": "./windows/hooks.nsh"
       }
     },
+    "linux": {
+      "deb": {
+        "depends": [
+          "webkit2gtk-4.1",
+          "libssl3"
+        ]
+      }
+    },
+    "macOS": {
+      "minimumSystemVersion": "12.0"
+    },
     "resources": [
       "cybrtech-tools/**/*",
       "python-runtime/**/*"
     ],
-    "icon": ["icons/32x32.png", "icons/128x128.png", "icons/128x128@2x.png", "icons/icon.icns", "icons/icon.ico"]
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
   }
 }
