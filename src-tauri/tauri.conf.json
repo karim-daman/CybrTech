@@ -4,9 +4,9 @@
   "version": "0.1.0",
   "identifier": "com.cybrtech",
   "build": {
-    "beforeDevCommand": "python setup-env.py --dev",
+    "beforeDevCommand": "npm run setup:dev",
     "devUrl": "http://localhost:1420",
-    "beforeBuildCommand": "python setup-env.py --build",
+    "beforeBuildCommand": "npm run setup:build",
     "frontendDist": "../build"
   },
   "app": {
